@@ -1,148 +1,60 @@
 # Software Requirements Specification (SRS)
-## Enhanced Real-Time Risk Control Engine for Bank Transfer Systems
-**Based on Baseline Architecture Analysis of Open-Source Project "Radar"**
+## Project: High-Concurrency Real-Time Risk Control Engine (Radar Architecture Optimization)
 
-* **Document Version:** 1.0.0
-* **Standard Compliance:** IEEE 830 / ISO/IEC/IEEE 29148 Standard
-* **Date:** October 2026
-* **Status:** Proposed Architecture Specification
+### 1. Introduction
+#### 1.1 Purpose
+This document specifies the functional and non-functional requirements for the optimized **Radar Real-Time Risk Control Engine**, tailored specifically for high-concurrency online bank transfer scenarios. The objective is to eliminate synchronous bottlenecks, minimize network I/O latency, and prevent cascading failures between the Core Banking Transfer System and the risk engine.
 
----
-
-## 1. Introduction
-
-### 1.1 Purpose
-This Software Requirements Specification (SRS) defines the functional and non-functional requirements for refactoring and enhancing the open-source real-time risk control engine **Radar** (`com.pgmmers:radar`). The objective is to bridge the architectural gap between a lightweight standalone decision engine and the stringent latency, throughput, and availability demands of high-concurrency commercial bank transfer pipelines.
-
-### 1.2 Document Conventions
-This document adheres to the IEEE standard terminology:
-* **SHALL**: Indicates a mandatory requirement.
-* **SHOULD**: Indicates a recommended requirement that is subject to trade-off evaluation.
-* **MAY**: Indicates an optional design capability.
-
-### 1.3 Intended Audience
-* **Software Architects & Reviewers**: To evaluate architectural trade-offs, pattern applications, and resilience strategies.
-* **Backend Engineers**: To implement pipeline filters, local caching tiers, circuit breakers, and asynchronous event pipelines.
-* **Risk Control Operations & Compliance Staff**: To understand rule evaluation pipelines, fail-safe modes, and audit logging.
-
-### 1.4 Project Scope
-The target system serves as the synchronous transaction evaluation gatekeeper and asynchronous behavioral monitor for an online banking transfer subsystem. It ingests transactional events, computes dynamic features (sliding-window metrics, IP-derived location, device data), evaluates business-configured risk rules via dynamic scripting (Groovy), invokes machine learning scores (TensorFlow), issues an execution verdict (`PASS`, `CHALLENGE`, `REJECT`), and asynchronously commits immutable audit trails.
-
-### 1.5 References
-1. Mark Richards, *Software Architecture Patterns*, O'Reilly Media.
-2. Michael Nygard, *Architecture Decision Records (ADR)*.
-3. Open-source repository: `wfh45678/radar` (Spring Boot 2.2.5, Redis, Groovy, Elasticsearch, MySQL).
+#### 1.2 Scope
+The system comprises two primary modules:
+* **`radar-admin`**: Web-based management portal for configuring dynamic Groovy rules, managing static blacklists/whitelists, and querying historical audit logs.
+* **`radar-engine`**: High-throughput execution engine responsible for ingesting transfer requests, evaluating local and dynamic rules, extracting real-time features, and dispatching audit logs asynchronously.
 
 ---
 
-## 2. Overall Description
-
-### 2.1 Product Perspective
-The baseline Radar system operates as a layered monolithic/service architecture where an upstream core banking transfer service synchronously waits for decision results over HTTP/REST. 
-
-Under the enhanced architecture, the system operates across three tiers:
-1. **Business Ingestion Tier**: Core banking transfer service protected by a client-side circuit breaker.
-2. **Radar Decision Engine Core**: Two-level pipeline combining L1 local in-memory pre-filtering (Pipes & Filters) and L2 complex aggregation.
-3. **Storage & Asynchronous Infrastructure Tier**: Redis for shared hot counters, Caffeine for node-local state, MySQL for rule configuration metadata, and Kafka + Elasticsearch for asynchronous deep audit and behavioral analytics.
-
-```
-[Core Banking Service]
-        │
-   (HTTP/RPC + Circuit Breaker)
-        ▼
-[Radar Engine: L1 In-Memory Filter (Caffeine)] ──Hit Hard Limit/Blacklist──► [REJECT (<1ms)]
-        │ (Passed 80% Traffic)
-        ▼
-[Radar Engine: L2 Aggregation Engine (Redis)]  ──Timeout / Error──────────► [Fallback Tier]
-        │
-   (Synchronous Verdict: PASS / CHALLENGE)
-        │
-        ├─────────────────────────────────────────┐
-        ▼                                         ▼
-[Execute Transfer]                    [Kafka Asynchronous Event Bus]
-                                                  │
-                                                  ▼
-                                      [Worker / Elasticsearch Audit]
-```
-
-### 2.2 User Characteristics
-* **End Customers**: Require transparent, instant transfers with response times strictly under 200ms end-to-end.
-* **Risk Strategists**: Configure and modify fraud rules dynamically via `radar-admin` without requiring service redeployment.
-* **System Auditors**: Require unalterable historical decision records for anti-money laundering (AML) regulatory compliance.
-
-### 2.3 Operating Environment
-* **Runtime**: Java Virtual Machine (JDK 1.8 / 11+ compatible).
-* **Framework**: Spring Boot 2.2.5.RELEASE.
-* **Data Stores**: Redis Cluster 6.x+, MySQL 8.0+, Elasticsearch 7.11.2+.
-* **Messaging**: Apache Kafka 2.x+ / RabbitMQ.
-
-### 2.4 Design and Implementation Constraints
-* **CON-1 (Backward Compatibility)**: Existing rule definitions written in Groovy 2.4.6 and MySQL configuration schemas SHALL remain compatible.
-* **CON-2 (Lightweight Footprint)**: Refactoring SHALL prioritize low-overhead in-process libraries (e.g., Caffeine, Resilience4j) over heavyweight distributed streaming clusters (e.g., full Apache Flink cluster).
-* **CON-3 (Security & Compliance)**: Customer PII (Personally Identifiable Information) and bank account numbers SHALL be masked in all Redis keys and audit log streams.
+### 2. System Architecture & Data Flow
+The risk evaluation pipeline follows a decoupled, fast-path/slow-path architecture:
+1. **Ingress & Context Encapsulation**: Core Banking invokes `radar-engine` via **gRPC**. `ContextBuilder` parses the Protobuf payload, validates mandatory fields, and initializes a standardized internal `Context` object.
+2. **Local Pre-Filtering (Fast Path)**: `radar-engine` evaluates static hard rules and deterministic blacklists/whitelists cached in **local JVM memory (Caffeine)** before making any external network calls.
+3. **Real-Time Feature Extraction**: For transactions passing local pre-filtering, the feature service queries external **Redis** clusters for sliding-window behavioral metrics (e.g., 10-minute transfer frequency) and populates the `Context`.
+4. **Dynamic Rule & Model Evaluation**: The decision engine executes **Groovy dynamic rules** (persisted in **MySQL**, hot-reloaded into memory) and optional ML scoring models to calculate a cumulative Risk Score.
+5. **Immediate Response & Asynchronous Logging**: `radar-engine` immediately returns the decision (`PASS`, `CHALLENGE`, or `REJECT`) to Core Banking, while publishing full execution traces to **Kafka** for asynchronous ingestion into **Elasticsearch**.
 
 ---
 
-## 3. Specific Requirements
+### 3. Functional Requirements
 
-### 3.1 External Interface Requirements
+#### FR-1: High-Speed RPC Ingress & Context Building
+* **FR-1.1**: The system shall expose a **gRPC** service endpoint using Protocol Buffers (Protobuf) to receive synchronous risk evaluation requests from the Core Banking Transfer System.
+* **FR-1.2**: `ContextBuilder` shall validate required transaction attributes (source account, target account, amount, timestamp, device ID, IP) and generate a unique `eventId` within a unified internal `Context` object.
 
-#### 3.1.1 Software Interfaces
-* **SI-1 (Core Ingress API)**:
-  * Protocol: Synchronous HTTP/1.1 POST / gRPC.
-  * Endpoint: `/api/v1/risk/evaluate`
-  * Input Payload: JSON containing `transactionId`, `sourceAccount`, `targetAccount`, `amount`, `currency`, `timestamp`, `clientIp`, `deviceId`.
-  * Response Payload: JSON containing `transactionId`, `verdict` (`PASS`, `CHALLENGE`, `REJECT`), `score`, `riskRuleHits`, `executionTimeMs`.
-* **SI-2 (Asynchronous Event Egress)**:
-  * Protocol: Apache Kafka Topic `risk.transfer.events.v1`.
-  * Payload: Protobuf/JSON schema carrying decision context, raw request attributes, evaluated features, and verdict timestamp.
+#### FR-2: Local In-Memory Pre-Filtering
+* **FR-2.1**: The engine shall maintain an in-process local cache (**Caffeine**) storing deterministic blacklists, trusted whitelists, and static threshold rules (e.g., single-transaction hard limits).
+* **FR-2.2**: Transactions matching local hard-reject rules or trusted whitelists shall short-circuit the pipeline immediately, bypassing remote Redis feature queries.
 
----
+#### FR-3: Dynamic Rule Management & Evaluation
+* **FR-3.1**: Administrators shall create, update, and version **Groovy** rule scripts via `radar-admin`, persisted in **MySQL** with full ACID transaction guarantees.
+* **FR-3.2**: `radar-engine` shall support zero-downtime hot-reloading of updated Groovy scripts into memory.
+* **FR-3.3**: The engine shall aggregate risk scores across all triggered rules and map the total score to configurable thresholds (`PASS`, `CHALLENGE`, `REJECT`).
 
-### 3.2 Functional Requirements
+#### FR-4: Circuit Breaking & Tiered Graceful Degradation
+* **FR-4.1**: The Core Banking client boundary shall enforce a strict **50ms timeout** and an automated **Circuit Breaker** when invoking `radar-engine`.
+* **FR-4.2**: Upon timeout or circuit-open state, the system shall execute tiered fallback logic based on transaction amount:
+  * **Low-Value Transfers** (below configurable threshold): Default to **Fail-Open (`PASS`)** to preserve user experience and payment availability.
+  * **High-Value Transfers** (at or above threshold): Downgrade to **Secondary Verification (`CHALLENGE`)** via SMS OTP or biometric facial recognition.
 
-#### 3.2.1 Level-1 In-Memory Pre-Filtering (Pipes & Filters)
-* **FR-1.1**: The system SHALL maintain a synchronized local memory cache (L1 Cache via Caffeine) containing static high-risk account blacklists and system-level hard limits (e.g., maximum single-transaction amount).
-* **FR-1.2**: If a transaction violates a hard limit or matches a local blacklist entity, the engine SHALL immediately terminate evaluation, return a `REJECT` verdict, and short-circuit any subsequent remote storage I/O.
-* **FR-1.3**: The L1 cache SHALL support dynamic invalidation within 5 seconds upon rule or list modification in `radar-admin`.
-
-#### 3.2.2 Level-2 Dynamic Feature & Rule Aggregation
-* **FR-2.1**: For requests passing L1, the engine SHALL compute dynamic sliding-window features (e.g., transfer count in past 10 minutes, total sum across 24 hours) against Redis.
-* **FR-2.2**: Multi-feature Redis operations SHALL be dispatched using Redis Pipelining or batched `MGET` to constrain network round-trip time (RTT).
-* **FR-2.3**: Dynamic business rules defined by risk analysts SHALL be evaluated through pre-compiled Groovy scripts without runtime compilation overhead on every transaction.
-
-#### 3.2.3 Tiered Decision Enforcement
-* **FR-3.1**: The evaluation response SHALL support a tri-state verdict model:
-  1. `PASS`: Transaction allowed to proceed directly.
-  2. `CHALLENGE`: Transaction held pending secondary out-of-band verification (SMS OTP / Biometric authentication).
-  3. `REJECT`: Transaction blocked immediately due to confirmed fraudulent patterns.
-
-#### 3.2.4 Asynchronous Audit and AML Archival
-* **FR-4.1**: Following synchronous verdict emission, the engine SHALL emit full transaction event data to an asynchronous message broker (Kafka).
-* **FR-4.2**: Decoupled consumer workers SHALL consume the message topic to perform asynchronous Elasticsearch indexing and long-window behavioral correlation without blocking upstream transaction threads.
+#### FR-5: Asynchronous Audit Logging & Search
+* **FR-5.1**: Upon decision completion, `radar-engine` shall publish complete audit payloads (input context, triggered rules, individual rule scores, final decision) to a **Kafka** topic without blocking the gRPC response thread.
+* **FR-5.2**: Background Kafka consumers shall consume audit events and index them into **Elasticsearch** to support sub-second regulatory compliance queries and customer dispute investigations.
 
 ---
 
-### 3.3 Non-Functional Requirements (Quality Attributes)
+### 4. Non-Functional Requirements
 
-#### 3.3.1 Performance & Latency (NFR-1)
-* **NFR-1.1 (Latency)**: Under a baseline load of 2,000 Transactions Per Second (TPS), the synchronous 99th percentile (P99) risk evaluation latency SHALL be $\le 50\text{ ms}$.
-* **NFR-1.2 (L1 Fast-Path Latency)**: Hard-limit and blacklist evaluations executed solely within the L1 filter SHALL complete in $\le 1\text{ ms}$.
-* **NFR-1.3 (Throughput)**: A single enhanced 4-core 8GB container node SHALL sustain at least 1,500 TPS without exceeding 80% sustained CPU utilization.
-
-#### 3.3.2 Availability & Resilience (NFR-2)
-* **NFR-2.1 (Uptime Target)**: The bank transfer verification capability SHALL achieve an availability of $99.999\%$ (no more than 5.26 minutes of downtime per year).
-* **NFR-2.2 (Circuit Breaking)**: Upstream clients SHALL wrap risk check invocations with a Circuit Breaker configured with a 50ms execution timeout and a 50% failure rate trip threshold over a sliding window of 100 calls.
-* **NFR-2.3 (Tiered Fallback)**:
-  * When the circuit breaker is in the `OPEN` state:
-    * Low-risk transactions ($\le \$1,000$ USD equivalent to recognized payees) SHALL execute a **Fail-Open** policy (pass transaction, tag for post-audit).
-    * High-risk or unfamiliar payee transactions SHALL execute a **Challenge-Fallback** policy (require secondary SMS/Biometric validation).
-  * System-wide hard crashes SHALL NOT cause unhandled 500 errors to interrupt core banking ledger execution.
-
-#### 3.3.3 Scalability (NFR-3)
-* **NFR-3.1**: The decision engine tier SHALL remain stateless, allowing linear horizontal scaling by adding engine container instances behind an internal load balancer.
-* **NFR-3.2**: Redis feature storage SHALL support cluster mode partitioning by hashing on `sourceAccount` to avoid hotspot keys during payroll batch events.
-
-#### 3.3.4 Security & Auditability (NFR-4)
-* **NFR-4.1**: Every completed risk assessment SHALL generate an immutable trace containing a cryptographically verifiable transaction UUID, rule version identifier, and feature snapshot.
-* **NFR-4.2**: Audit logs stored in Elasticsearch SHALL be retained for a minimum of 180 days to fulfill banking financial supervisory requirements.
+| Category | Requirement Specification |
+| :--- | :--- |
+| **Latency** | P99 end-to-end risk evaluation latency shall remain **under 30ms** under normal load; hard timeout enforced at **50ms**. |
+| **Throughput** | Support **≥ 10,000 TPS** peak concurrency during bank promotional events or payroll cycles. |
+| **Availability** | Core transfer path availability of **99.999%** guaranteed via Circuit Breaker isolation and Fail-Open/Challenge degradation. |
+| **Data Durability** | Zero loss of regulatory audit logs guaranteed via Kafka disk persistence and consumer offset commits prior to Elasticsearch indexing. |
+| **Maintainability** | Rule updates via Groovy scripts must take effect within **5 seconds** without service restarts. |
