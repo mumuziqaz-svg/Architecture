@@ -1,94 +1,57 @@
-# 1. Architectural Restructuring for High-Concurrency Bank Transfer Risk Control
-
-* **Status:** Proposed
-* **Date:** 2026-10-26
-* **Deciders:** Software Architecture Project Team
-* **Target System:** Radar Real-Time Risk Control Engine (`com.pgmmers:radar`)
+# Architecture Decision Record (ADR)
+## Project: Radar Real-Time Risk Control Engine — High-Concurrency Optimization
 
 ---
 
-## Context and Problem Statement
-
-The baseline open-source project **Radar** provides a modular real-time risk control solution utilizing Spring Boot, dynamic Groovy rule execution, and centralized storage (Redis, MySQL, Elasticsearch). However, when evaluated against the quality attributes of a commercial online banking transfer subsystem (sub-50ms latency, high concurrent TPS, and 99.999% availability), the existing architecture exhibits three critical deficiencies:
-
-1. **Remote Network I/O Amplification**: Each evaluation synchronously issues multiple sequential network round-trips to Redis to fetch sliding-window counters and query blacklists, driving P99 latency above 100ms under network jitter.
-2. **Cascading Failure Vulnerability (Tight Synchronous Coupling)**: The upstream core banking service waits synchronously on Radar over REST HTTP. The absence of fault isolation mechanisms (such as circuit breakers or thread pool bulkheads) risks exhausting upstream connection pools if Radar encounters GC pauses or database latency spikes.
-3. **Heavy Synchronous Execution Path**: Hard rejection checks, complex dynamic script interpretation, model scoring, and Elasticsearch audit logging are conflated into a single synchronous thread, limiting vertical scalability and horizontal throughput.
-
----
-
-## Decision Drivers
-
-* **Performance**: Synchronous P99 latency must not exceed 50ms under peak transfer conditions.
-* **Availability**: Failure or latency spikes in the risk engine must not cause outages in the core bank transfer channel.
-* **Implementation Feasibility**: The solution must avoid introducing heavy, operationally complex big data streaming frameworks (e.g., multi-node Apache Flink clusters) while delivering measurable architectural resilience.
-* **Alignment with Architectural Styles**: Practical application of classic architectural patterns from Mark Richards' *Software Architecture Patterns* (Layered, Pipes & Filters, Event-Driven, Space-Based In-Memory Caching).
+### ADR-001: Replace HTTP/1.1 REST with gRPC (Protobuf + HTTP/2) for Ingress Communication
+* **Status**: Accepted
+* **Context**: In high-concurrency bank transfer scenarios, the legacy HTTP/1.1 REST interface relies on verbose JSON text serialization and suffers from head-of-line blocking and repeated TCP/header overhead, introducing avoidable network latency at the entry point (`ContextBuilder`).
+* **Decision**: Replace internal service-to-service HTTP REST endpoints between the Core Banking System and `radar-engine` with **gRPC** over **HTTP/2**, using **Protocol Buffers (Protobuf)** for binary serialization.
+* **Consequences**:
+  * **Positive**: Reduces payload size by ~60–80%, accelerates serialization/deserialization, and enables multiplexed concurrent requests over persistent HTTP/2 connections.
+  * **Negative**: Requires `.proto` schema governance across Core Banking and Risk teams; binary payloads are not directly human-readable during raw packet inspection.
 
 ---
 
-## Considered Options
-
-* **Option 1: Status Quo (Scale Redis and JVM Vertically)**
-  * Retain existing single-path synchronous Groovy + Redis architecture; increase Redis replicas and allocate larger JVM heap space.
-* **Option 2: Heavyweight Distributed Stream Processing Overhaul**
-  * Completely replace `radar-engine` with an Apache Flink + Kafka + RocksDB stateful stream-processing topology.
-* **Option 3: Two-Level Pipeline with Local Memory Filtering, Resilience4j Circuit Breaker, and Asynchronous Event Bypass (Selected)**
-  * Restructure the evaluation pipeline using the **Pipes & Filters** pattern with node-local **Caffeine** L1 caching.
-  * Encapsulate ingress calls using the **Circuit Breaker & Bulkhead** pattern.
-  * Offload audit logging and heavy post-decision calculations to an **Event-Driven Architecture (EDA)** broker topology using Kafka.
+### ADR-002: Introduce Local In-Memory Cache (Caffeine) for Static Rules & Hot Lists
+* **Status**: Accepted
+* **Context**: The baseline Radar engine queries external **Redis** instances over the network for every incoming transaction. Under high concurrency, repetitive network round-trips for static blacklists and simple threshold checks create network I/O bottlenecks and inflate tail latency.
+* **Decision**: Embed an in-process **Caffeine** local memory cache inside `radar-engine` to store deterministic blacklists/whitelists and static Groovy rules that do not depend on historical sliding-window counters.
+* **Consequences**:
+  * **Positive**: Eliminates network hops (nanosecond-level local access) for obvious high-risk or whitelisted transfers, significantly reducing Redis QPS and overall engine latency.
+  * **Negative**: Bounded by JVM heap capacity; requires an event-driven cache invalidation/refresh mechanism when administrators update lists in `radar-admin`.
 
 ---
 
-## Decision Outcome
-
-**Chosen Option: Option 3**.
-
-We decided to refactor the transaction decision path into a hybrid two-level pipeline supported by client-side resilience and an asynchronous event bypass:
-
-### Architectural Components of the Selected Solution
-
-1. **L1 Local Memory Filter (Pipes & Filters Pattern)**:
-   * Introduce Caffeine as an in-process L1 cache inside `radar-engine`.
-   * Static blacklists, high-risk BIN ranges, and hard single-transaction limit rules are evaluated directly in JVM memory (<1ms).
-   * Short-circuiting logic terminates evaluation immediately upon an L1 violation, eliminating unnecessary remote Redis I/O for up to 80% of trivial or explicitly malicious traffic.
-
-2. **Upstream Circuit Breaker & Tiered Fallback (Resilience & Bulkhead Patterns)**:
-   * Deploy Resilience4j at the transfer service invocation boundary with a strict 50ms timeout.
-   * If the risk engine stalls, the circuit trips (`OPEN`) and activates automated tiered fallbacks:
-     * Low-value transfers are handled via **Fail-Open** with an audit flag.
-     * High-value transfers trigger a **Challenge Fallback** (prompting the customer for two-factor SMS/biometric verification), preserving core banking service continuity while limiting fraud exposure.
-
-3. **Asynchronous Bypass for Audit & Deep Analytics (Event-Driven Broker Topology)**:
-   * Once a synchronous verdict (`PASS` / `CHALLENGE`) is rendered, transaction metadata and feature context are dispatched asynchronously to a Kafka topic.
-   * Background workers consume the topic to asynchronously write historical records to Elasticsearch and trigger deep anti-money laundering (AML) pattern matching.
+### ADR-003: Implement 50ms Timeout Circuit Breaker and Tiered Degradation
+* **Status**: Accepted
+* **Context**: The original synchronous coupling between Core Banking and Radar creates a single point of cascading failure: if Redis experiences network jitter or `radar-engine` saturates under load, Core Banking threads block indefinitely, paralyzing all bank transfers.
+* **Decision**: Wrap the `radar-engine` invocation boundary with a **Circuit Breaker** configured with a strict **50ms timeout** and a **tiered degradation strategy**:
+  1. *Low-value transactions*: **Fail-Open** (auto-approve to maintain payment continuity).
+  2. *High-value transactions*: Fallback to **Step-Up Authentication** (SMS OTP / facial recognition).
+* **Consequences**:
+  * **Positive**: Completely isolates Core Banking from risk engine slowdowns or outages while balancing business continuity (low-value) against financial security (high-value).
+  * **Negative**: Introduces minor controlled risk exposure on small-value transfers during active circuit-open windows; requires careful tuning of timeout thresholds and amount tiers.
 
 ---
 
-## Pros and Cons of the Selected Option
-
-### Positive Consequences
-* **Extreme Latency Reduction**: Eliminating Redis network RTTs for L1-evaluated traffic reduces average evaluation latency from >40ms to sub-millisecond ranges. Overall P99 stays comfortably below 30ms.
-* **Failure Decoupling**: Core bank transfer operations are insulated from downstream risk engine crashes and network partitions.
-* **Throughput Scalability**: Stripping Elasticsearch indexing and deep analytics from the synchronous thread frees CPU and connection resources for primary transaction verification.
-* **Cost Efficiency**: Implementation leverages lightweight, in-process Java components without requiring dedicated streaming infrastructure.
-
-### Negative Consequences and Mitigations
-* **Cache Invalidation Latency**:
-  * *Trade-off*: Local Caffeine instances risk serving stale blacklist data if an update occurs in `radar-admin`.
-  * *Mitigation*: Broadcast cache invalidation events via a lightweight Redis Pub/Sub topic to achieve sub-second synchronization across all engine nodes.
-* **Eventual Consistency in Audit Logs**:
-  * *Trade-off*: Elasticsearch audit records lag synchronous transactions by several hundred milliseconds.
-  * *Mitigation*: Acceptable for banking regulatory compliance, as operational transaction ledgers maintain synchronous primary database guarantees.
-* **Operational Overhead**:
-  * *Trade-off*: Introduces a message broker (Kafka) dependency into the production topology.
-  * *Mitigation*: Utilizes standard managed Kafka or lightweight cluster configurations, reusing Radar's native `radar-kafka-demo` module structure.
+### ADR-004: Decouple Audit Logging from the Critical Path via Kafka to Elasticsearch
+* **Status**: Accepted
+* **Context**: Legacy Radar synchronously writes detailed execution audit logs directly to **Elasticsearch** before returning a `PASS`/`REJECT` decision. Any disk I/O spike or indexing slowdown in Elasticsearch directly blocks transaction responses.
+* **Decision**: Separate the real-time decision path from post-transaction persistence by introducing **Apache Kafka** as an asynchronous buffer. `radar-engine` returns the decision immediately upon rule scoring and publishes the audit record to Kafka, where background consumers batch-index logs into Elasticsearch.
+* **Consequences**:
+  * **Positive**: Removes Elasticsearch write latency from the critical path, absorbs traffic spikes ("peak shaving"), and guarantees zero log loss if Elasticsearch undergoes maintenance.
+  * **Negative**: Introduces eventual consistency (typically < 1–2 seconds delay) before audit logs become searchable in `radar-admin`; adds Kafka cluster operational overhead.
 
 ---
 
-## Architectural Pattern Mapping Summary
-
-| Problem in Baseline Radar | Chosen Pattern / Technique | Component in Refactored Design |
-| :--- | :--- | :--- |
-| Remote I/O Amplification | **Pipes & Filters** + In-Memory Caching | L1 Filter using Caffeine within `radar-service-impl` |
-| Synchronous Cascading Failure | **Circuit Breaker** & **Bulkhead** | Resilience4j wrapper at API Ingress boundary |
-| Heavy Real-Time Processing Path | **Event-Driven Architecture (EDA)** | Kafka broker + decoupled async consumers for ES audit |
+### ADR-005: Hybrid Polyglot Persistence Strategy (MySQL + Redis + Elasticsearch)
+* **Status**: Accepted
+* **Context**: Different data types within a risk engine have conflicting requirements regarding ACID durability, sub-millisecond access, and full-text searchability.
+* **Decision**: Adopt a dedicated three-tier storage architecture:
+  * **MySQL**: Authoritative relational store for Groovy rule definitions, versioning, and RBAC configurations requiring ACID transactions.
+  * **Redis**: Distributed in-memory key-value store for high-frequency real-time sliding-window counters (e.g., 10-minute transfer velocity).
+  * **Elasticsearch**: Distributed document search engine for massive-scale historical audit logs and multi-dimensional compliance queries.
+* **Consequences**:
+  * **Positive**: Each workload runs on a storage engine optimized for its exact access pattern.
+  * **Negative**: Requires maintaining three distinct persistence technologies and clear data synchronization pipelines between them.
